@@ -4,6 +4,10 @@ Support for OAuth 2 and OpenId Connect (OIDC) in Angular. Already prepared for t
 
 ![OIDC Certified Logo](https://raw.githubusercontent.com/manfredsteyer/angular-oauth2-oidc/master/oidc.png)
 
+## Fork für iframe-refresh via Authcodeflow - impl. für HUK
+
+TODO Beschreibung
+
 ## Credits
 
 - [jsrsasign](https://kjur.github.io/jsrsasign/) for validating token signature and for hashing

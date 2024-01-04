@@ -1,0 +1,7 @@
+<html>
+<body>
+    <script>
+        (window.opener || window.parent).postMessage({id:  window.frameElement.id, searchParams: location.hash || ('#' + location.search)}, location.origin);
+    </script>
+</body>
+</html>
