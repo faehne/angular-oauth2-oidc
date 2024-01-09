@@ -1,3 +1,5 @@
+import { HashHandler } from "angular-oauth2-oidc";
+import { b64DecodeUnicode, base64UrlEncode } from "./base64-helper";
 import { WebHttpUrlEncodingCodec } from "./encoder";
 import { EventType, OAuthErrorEvent, OAuthSuccessEvent } from "./events";
 import { TokenResponse } from "./types";
@@ -56,8 +58,11 @@ export interface OAIFAuthorizeConfig {
   authorizeUri: string;
   clientId: string;
   events: Observable<OAIFEvent>;
+  storeNonce: (tokenKeyWithPrefix: string, nonce: string) => void;
   storeAccessToken: (tokenKeyWithPrefix: string, access_token: string) => void;
   retrieveAccessToken: (tokenKeyWithPrefix: string) => string;
+  storePkceVerifier: (tokenKeyWithPrefix: string, verifier: string) => string;
+  hashHandler: HashHandler;
 }
 
 
@@ -206,11 +211,65 @@ export function setupSilentRefreshEventListener(oldListener,config: OAIFListener
       return newListener;
 }
 
+function createNonce(): Promise<string> {
+  return new Promise((resolve) => {
+    const unreserved =
+      'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~';
+    let size = 45;
+    let id = '';
+
+    const crypto =
+      typeof self === 'undefined' ? null : self.crypto || self['msCrypto'];
+    if (crypto) {
+      let bytes = new Uint8Array(size);
+      crypto.getRandomValues(bytes);
+
+      // Needed for IE
+      if (!bytes.map) {
+        (bytes as any).map = Array.prototype.map;
+      }
+
+      bytes = bytes.map((x) => unreserved.charCodeAt(x % unreserved.length));
+      id = String.fromCharCode.apply(null, bytes);
+    } else {
+      while (0 < size--) {
+        id += unreserved[(Math.random() * unreserved.length) | 0];
+      }
+    }
+
+    resolve(base64UrlEncode(id));
+  });
+}
+
+function createAndSaveNonce(config: OAIFAuthorizeConfig): Promise<string> {
+  const that = this; // eslint-disable-line @typescript-eslint/no-this-alias
+  return this.createNonce().then(function (nonce: any) {
+    config.storeNonce(SILENT_TOKEN_PREFIX + config.tokenKey,nonce);
+    return nonce;
+  });
+}
+
+async function createChallangeVerifierPairForPKCE(config: OAIFAuthorizeConfig): Promise<
+    [string, string]
+  > {
+    if (!this.crypto) {
+      throw new Error(
+        'PKCE support for code flow needs a CryptoHander. Did you import the OAuthModule using forRoot() ?'
+      );
+    }
+
+    const verifier = await createNonce();
+    const challengeRaw = await config.hashHandler.calcHash(verifier, 'sha-256');
+    const challenge = base64UrlEncode(challengeRaw);
+
+    return [challenge, verifier];
+  }
+
 async function createLoginUrl(
   config: OAIFAuthorizeConfig, redirectUri: string
 ): Promise<string> {
 
-  const state = await createAndSaveNonce();
+  const state = await createAndSaveNonce(config);
 
   let url =
     config.authorizeUri +
@@ -226,16 +285,9 @@ async function createLoginUrl(
     encodeURIComponent(config.scopes);
 
   const [challenge, verifier] =
-    await createChallangeVerifierPairForPKCE();
+    await createChallangeVerifierPairForPKCE(config);
 
-  if (
-    this.saveNoncesInLocalStorage &&
-    typeof window['localStorage'] !== 'undefined'
-  ) {
-    localStorage.setItem('PKCE_verifier', verifier);
-  } else {
-    this._storage.setItem('PKCE_verifier', verifier);
-  }
+  config.storePkceVerifier(SILENT_TOKEN_PREFIX + config.tokenKey,verifier)
 
   url += '&code_challenge=' + challenge;
   url += '&code_challenge_method=S256';
@@ -254,9 +306,15 @@ function checkExistingTokenPendingOrSetPending(config: OAIFAuthorizeConfig): boo
   }
 }
 
+function isTokenNotExpired(token: string) {
+  return (JSON.parse(b64DecodeUnicode(token.split('.')[1])).exp * 1000)
+    >
+    new Date().getTime();
+}
+
 function checkExistingTokenAndNotExpired(config: OAIFAuthorizeConfig): boolean {
   const currentToken = config.retrieveAccessToken(SILENT_TOKEN_PREFIX + config.tokenKey);
-  return !!currentToken; //TODO: && !isTokenExpired(currentToken)
+  return !!currentToken && isTokenNotExpired(currentToken)
 }
 
 export function oaifToken(config: OAIFAuthorizeConfig): Promise<OAIFEvent> {
@@ -265,41 +323,44 @@ export function oaifToken(config: OAIFAuthorizeConfig): Promise<OAIFEvent> {
         return of(new OAIFSuccessEvent('silently_refreshed',SILENT_TOKEN_PREFIX + config.tokenKey)).toPromise();
     }
 
-    if (typeof document === 'undefined') {
+    if(!checkExistingTokenPendingOrSetPending(config)) {
+      if (typeof document === 'undefined') {
         throw new Error('silent refresh is not supported on this platform');
-    }
-
-    const existingIframe = document.getElementById(
-        SILENT_TOKEN_PREFIX + config.tokenKey
-    );
-  
-    if (existingIframe) {
-        document.body.removeChild(existingIframe);
-    }
-
-    const iframe = document.createElement('iframe');
-    iframe.id =SILENT_TOKEN_PREFIX + config.tokenKey;
-
-    const redirectUri = window.location.origin + "/silent-refresh-oaif.html";
-    createLoginUrl(config,redirectUri).then(
-      (url) => {
-        iframe.setAttribute('src', url);
-        iframe.style['display'] = 'none';
-        document.body.appendChild(iframe);
       }
-    );
 
-    const errors = this.events.pipe(
+      const existingIframe = document.getElementById(
+          SILENT_TOKEN_PREFIX + config.tokenKey
+      );
+    
+      if (existingIframe) {
+          document.body.removeChild(existingIframe);
+      }
+
+      const iframe = document.createElement('iframe');
+      iframe.id =SILENT_TOKEN_PREFIX + config.tokenKey;
+
+      const redirectUri = window.location.origin + "/silent-refresh-oaif.html";
+      createLoginUrl(config,redirectUri).then(
+        (url) => {
+          iframe.setAttribute('src', url);
+          iframe.style['display'] = 'none';
+          document.body.appendChild(iframe);
+        }
+      );
+    }
+    
+
+    const errors = config.events.pipe(
       filter((e) => e instanceof OAuthErrorEvent),
       first()
     );
-    const success = this.events.pipe(
+    const success = config.events.pipe(
       filter((e) => e.type === 'token_received'),
       first()
     );
     const timeout = of(
       new OAIFErrorEvent('silent_refresh_timeout',SILENT_TOKEN_PREFIX + config.tokenKey, null)
-    ).pipe(delay(this.silentRefreshTimeout));
+    ).pipe(delay(10000));
 
     return race([errors, success, timeout])
       .pipe(
@@ -307,6 +368,10 @@ export function oaifToken(config: OAIFAuthorizeConfig): Promise<OAIFEvent> {
           if (e instanceof OAuthErrorEvent) {
             if (e.type !== 'silent_refresh_timeout') {
               e = new OAIFErrorEvent('silent_refresh_error',SILENT_TOKEN_PREFIX + config.tokenKey, e);
+            } else {
+              if(checkExistingTokenAndNotExpired(config)) {
+                e = of(new OAIFSuccessEvent('silently_refreshed',SILENT_TOKEN_PREFIX + config.tokenKey)).toPromise();
+              }
             }
             throw e;
           } else if (e.type === 'token_received') {
